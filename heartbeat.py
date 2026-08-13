@@ -1,10 +1,4 @@
 """
-Bridge-sim heartbeat script.
-
-Runs a persistent loop (NOT a cron job — cron can't go sub-minute) that
-ticks the Reactor bars up and occasionally spikes/raises Life Support heat,
-writing state straight into the shared Google Sheet via batched API calls.
-
 SETUP (one-time):
   1. pip install gspread google-auth
   2. In Google Cloud Console: create a project -> enable "Google Sheets API"
@@ -14,36 +8,10 @@ SETUP (one-time):
      email address (looks like xxx@xxx.iam.gserviceaccount.com) as Editor.
   4. Fill in SHEET_ID below (the long id in the sheet's URL).
 
-SHEET LAYOUT THIS SCRIPT EXPECTS:
-
-  "Reactor" worksheet:
-    A            B            C
-    Bar name     Value(0-100) Reset(TRUE/FALSE checkbox)
-    Bar 1        0            FALSE
-    Bar 2        0            FALSE
-    ...(5 rows)
-
-  "Life Support" worksheet:
-    B2 = current heat value
-    D2:D2 = scrolling history log (script appends a new row each tick,
-             point a native line chart at column D for the live graph)
-    F2 = "CORRUPT" flag cell — script occasionally writes CORRUPTED into it
-    G2 = reboot checkbox — player sets TRUE after clearing F2
-
-  "Pilot" worksheet (auto-created with headers on first run if missing):
-    Heading/speed matching under time pressure. B2/B3 = target heading (0-359)
-    and speed (1-9), which the pilot must match by typing into C2/C3 before
-    the countdown in B5 hits zero. B6 = running score. This is one option
-    of a few discussed for the Pilot seat — swap tick_pilot() out for a
-    different minigame (e.g. an obstacle-dodge grid) if this one doesn't
-    feel right at the table.
-
-Tune the constants below to taste; nothing here is precious.
 """
 
 import random
 import time
-import datetime
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -53,7 +21,7 @@ from gspread.exceptions import APIError
 
 SHEET_ID = "1d55txSbBoXS4qjJ28L4NK9nylOJFoWGq0AReWvOyn6c"
 TICK_SECONDS = 2                # how often the loop runs
-REACTOR_DELTA_RANGE = (-2, 5)   # per-tick change per bar; can go up OR down,
+REACTOR_DELTA_RANGE = (0, 5)    # per-tick change per bar; can go up OR down,
                                  # each bar draws independently so they drift apart
 REACTOR_MELTDOWN_VALUE = 100
 HEAT_BASE_RISE = 1.5            # steady heat creep per tick
@@ -66,7 +34,20 @@ PILOT_ROUND_SECONDS = 10        # time allowed per heading/speed target
 HEADING_TOLERANCE = 15          # degrees, wraparound-aware
 SPEED_TOLERANCE = 1
 
-MAX_HISTORY = 250
+MAX_HISTORY = 20
+
+LIFE_TEMP_DISK_RANGE = "Life Support Computer!H2:K30"
+LIFE_STABILITY_DISK_RANGE = "Life Support Computer!L2:O30"
+LIFE_REBOOT_RANGE = "Life Support Computer!F2"
+
+MIN_GOOD_DATA_FOR_REBOOT = 8
+
+TEMP_RISE_PER_CORRUPTED = 1.5
+STABILITY_LOSS_PER_CORRUPTED = 1.0
+
+MAX_TEMPERATURE = 100
+MAX_STABILITY = 100
+MIN_STABILITY = 0
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -82,9 +63,11 @@ life_ws = sh.worksheet("Life Support")
 pilot_ws = sh.worksheet("Pilot")
 
 NUM_BARS = 5
+REACTOR_FIRST_ROW = 3
+REACTOR_LAST_ROW = REACTOR_FIRST_ROW + NUM_BARS - 1
 
-REACTOR_VALUES_RANGE = f"Reactor!B2:C{1 + NUM_BARS}"
-REACTOR_RESET_RANGE = f"Reactor!C2:C{1 + NUM_BARS}"
+REACTOR_VALUES_RANGE = f"Reactor!B{REACTOR_FIRST_ROW}:B{2 + NUM_BARS}"
+REACTOR_ADJUST_RANGE = f"Reactor!H5:H{4 + NUM_BARS}"
 
 def retry(fn, *args, retries=5, **kwargs):
     """
@@ -124,13 +107,12 @@ def ensure_pilot_sheet(state):
         {"range": "A6:B6", "values": [["Score", state["pilot_score"]]]},
     ])
 
-
 def load_inital_state():
     """One-time reads at startup: current reactor bar values, current heat,
     and where the Life Support history log currently ends."""
     state = {}
  
-    reactor_vals = retry(reactor_ws.get, f"B2:C{1 + NUM_BARS}")
+    reactor_vals = retry(reactor_ws.get, f"B{REACTOR_FIRST_ROW}:B{REACTOR_LAST_ROW}")
     bars = []
     for i in range(NUM_BARS):
         row = reactor_vals[i] if i < len(reactor_vals) else []
@@ -138,11 +120,15 @@ def load_inital_state():
         bars.append(val)
     state["reactor_bars"] = bars
  
-    heat_cell = retry(life_ws.acell, "B2").value
-    state["heat"] = float(heat_cell) if heat_cell not in (None, "") else 0
- 
-    corrupt_cell = retry(life_ws.acell, "F2").value
-    state["corrupted"] = bool(corrupt_cell)
+    temp_cell = retry(life_ws.acell, "B2").value
+    state["temperature"] = (
+        float(temp_cell) if temp_cell not in (None, "") else 0.0
+    )
+
+    stability_cell = retry(life_ws.acell, "C3").value
+    state["stability"] = (
+        float(stability_cell) if stability_cell not in (None, "") else 100.0
+    )    
  
     # Find the next empty row in the Life Support history column (D),
     # so future ticks can write directly without an append lookup.
@@ -153,6 +139,21 @@ def load_inital_state():
  
     return state
 
+def count_disk_data(block):
+    """Return (corrupted_count, good_data_count) for a Sheets range."""
+    corrupted_count = 0
+    good_data_count = 0
+
+    for row in block or []:
+        for cell in row:
+            value = str(cell).strip().upper()
+
+            if value == CORRUPT_TEXT:
+                corrupted_count += 1
+            elif value == "GOOD DATA":
+                good_data_count += 1
+
+    return corrupted_count, good_data_count   
 
 def tick(state):
     """One full tick: one batched read of player-editable cells, one
@@ -160,74 +161,156 @@ def tick(state):
  
     # ---- single batched read across all three worksheets ----
     ranges = [
-        REACTOR_RESET_RANGE,        # which bars the player reset this tick
-        "Life Support!F2",          # corrupt flag (player clears this)
-        "Life Support!G2",          # reboot checkbox (player sets this)
-        "Pilot!C2:C3",              # player's typed heading/speed
+        REACTOR_ADJUST_RANGE,
+        LIFE_REBOOT_RANGE,
+        LIFE_TEMP_DISK_RANGE,
+        LIFE_STABILITY_DISK_RANGE,
+        "Cockpit!C2:C3",              
     ]
     result = retry(sh.values_batch_get, ranges)
  
-    reset_block = None
-    corrupt_flag = None
+    adjust_block = None
+    reboot_flag = ""
+    temp_disk = []
+    stability_disk = []
     reboot_flag = None
     pilot_input = None
     for vr in result["valueRanges"]:
         rng = vr["range"]
         vals = vr.get("values", [])
+
         if rng.startswith("Reactor!"):
-            reset_block = vals
-        elif rng.startswith("Life Support!F2"):
-            corrupt_flag = vals[0][0] if vals and vals[0] else ""
-        elif rng.startswith("Life Support!G2"):
+            adjust_block = vals
+        elif rng.startswith("Life Support Computer!F2"):
             reboot_flag = vals[0][0] if vals and vals[0] else ""
-        elif rng.startswith("Pilot!"):
+        elif rng.startswith("Life Support Computer!H2:K30"):
+            temp_disk = vals
+        elif rng.startswith("Life Support Computer!L2:O30"):
+            stability_disk = vals
+        elif rng.startswith("Cockpit!"):
             pilot_input = vals
  
     writes = []  # list of {"range": "Sheet!A1", "values": [[...]]}
  
     # ---- Reactor ----
+    reactor_adjustments = []
     for i in range(NUM_BARS):
-        row_num = 2 + i
-        reset = False
-        if reset_block and i < len(reset_block) and reset_block[i]:
-            reset = str(reset_block[i][0]).upper() == "TRUE"
-        if reset:
-            state["reactor_bars"][i] = 0
-            writes.append({"range": f"Reactor!B{row_num}:C{row_num}", "values": [[0, False]]})
-        else:
-            delta = random.uniform(*REACTOR_DELTA_RANGE)
-            new_val = min(REACTOR_MELTDOWN_VALUE, max(0, state["reactor_bars"][i] + delta))
-            state["reactor_bars"][i] = new_val
-            writes.append({"range": f"Reactor!B{row_num}", "values": [[round(new_val, 1)]]})
-            if new_val >= REACTOR_MELTDOWN_VALUE:
-                print(f"!! Reactor bar {i + 1} hit meltdown threshold")
- 
+        try:
+            raw_value = adjust_block[i][0]
+            adjustment = float(raw_value)
+        except (IndexError, TypeError, ValueError):
+            adjustment = 0.0  # neutral / no movement for blank or invalid cells
+
+        # Optional: restrict player input to allowed directions.
+        adjustment = max(-1.0, min(1.0, adjustment))
+        reactor_adjustments.append(adjustment)
+
+    for i in range(NUM_BARS):
+        row_num = 3 + i
+
+        # H5 controls bar 1, H6 controls bar 2, etc.
+        adjust_direction = reactor_adjustments[i]
+
+        delta = random.uniform(*REACTOR_DELTA_RANGE) * adjust_direction
+        new_val = min(
+            REACTOR_MELTDOWN_VALUE,
+            max(0, state["reactor_bars"][i] + delta),
+        )
+
+        state["reactor_bars"][i] = new_val
+        writes.append({
+            "range": f"Reactor!B{row_num}",
+            "values": [[round(new_val, 1)]],
+        })
+
+        if new_val >= REACTOR_MELTDOWN_VALUE:
+            print(f"!! Reactor bar {i + 1} hit meltdown threshold")
+
+
     # ---- Life Support ----
-    corrupted = bool(corrupt_flag)
-    rebooted = str(reboot_flag).upper() == "TRUE"
- 
-    if rebooted and not corrupted:
-        state["heat"] = 20
-        writes.append({"range": "Life Support!G2", "values": [[False]]})
+    temp_corrupted, temp_good = count_disk_data(temp_disk)
+    stability_corrupted, stability_good = count_disk_data(stability_disk)
+
+    total_corrupted = temp_corrupted + stability_corrupted
+
+    temp_reboot_ready = (
+        temp_corrupted == 0
+        and temp_good >= MIN_GOOD_DATA_FOR_REBOOT
+    )
+
+    stability_reboot_ready = (
+        stability_corrupted == 0
+        and stability_good >= MIN_GOOD_DATA_FOR_REBOOT
+    )
+
+    reboot_ready = temp_reboot_ready and stability_reboot_ready
+    rebooted = str(reboot_flag).strip().upper() == "TRUE"
+
+    # A reboot is accepted only after both disks are clean and sufficiently restored.
+    if rebooted and reboot_ready:
+        state["temperature"] = 0.0
+        state["stability"] = MAX_STABILITY
+
+        writes.extend([
+            {"range": "Life Support Computer!F2", "values": [[False]]},
+            {"range": "Life Support Computer!B5", "values": [[
+                "REBOOT COMPLETE — systems nominal"
+            ]]},
+        ])
+
         print(">> Life Support rebooted successfully")
+
     else:
-        state["heat"] += HEAT_BASE_RISE
-        if random.random() < HEAT_SPIKE_CHANCE:
-            state["heat"] += random.uniform(*HEAT_SPIKE_AMOUNT)
-            print("!! Heat spike")
- 
-    if not corrupted and random.random() < CORRUPT_CHANCE:
-        writes.append({"range": "Life Support!F2", "values": [[CORRUPT_TEXT]]})
-        print("!! Life Support data corrupted — players must clear F2 then check G2")
- 
-    writes.append({"range": "Life Support!B2", "values": [[round(state["heat"], 1)]]})
- 
+        # Reset the checkbox when it was attempted before both disks were valid.
+        if rebooted:
+            writes.extend([
+                {"range": "Life Support Computer!F2", "values": [[False]]},
+                {"range": "Life Support Computer!B5", "values": [[
+                    "REBOOT DENIED — clear corruption and restore 8 GOOD DATA blocks per disk"
+                ]]},
+            ])
+            print(
+                ">> Reboot denied: "
+                f"temp disk: {temp_corrupted} corrupt / {temp_good} good; "
+                f"stability disk: {stability_corrupted} corrupt / {stability_good} good"
+            )
+
+        # No corrupt data means neither system gets worse this tick.
+        if total_corrupted > 0:
+            state["temperature"] = min(
+                MAX_TEMPERATURE,
+                state["temperature"] + total_corrupted * TEMP_RISE_PER_CORRUPTED,
+            )
+
+            state["stability"] = max(
+                MIN_STABILITY,
+                state["stability"] - total_corrupted * STABILITY_LOSS_PER_CORRUPTED,
+            )
+
+    # Current readouts
+    writes.extend([
+        {
+            "range": "Life Support Computer!B2",
+            "values": [[round(state["temperature"], 1)]],
+        },
+        {
+            "range": "Life Support Computer!C3",
+            "values": [[round(state["stability"], 1)]],
+        },
+    ])
+
+    # Circular two-column history: D = temperature, E = stability.
     if state["history_row"] > MAX_HISTORY:
-        state["history_row"] = 2  # wrap around instead of growing forever
+        state["history_row"] = 2
+
     writes.append({
-        "range": f"Life Support!D{state['history_row']}",
-        "values": [[f"{datetime.datetime.now().isoformat(timespec='seconds')}  {round(state['heat'], 1)}"]],
+        "range": f"Life Support Computer!D{state['history_row']}:E{state['history_row']}",
+        "values": [[
+            round(state["temperature"], 1),
+            round(state["stability"], 1),
+        ]],
     })
+
     state["history_row"] += 1
  
     # ---- Pilot ----
@@ -257,15 +340,15 @@ def tick(state):
         state["pilot_time_left"] = PILOT_ROUND_SECONDS
  
         writes.extend([
-            {"range": "Pilot!B2", "values": [[state["pilot_heading"]]]},
-            {"range": "Pilot!B3", "values": [[state["pilot_speed"]]]},
-            {"range": "Pilot!C2:C3", "values": [[""], [""]]},
-            {"range": "Pilot!D2", "values": [[status]]},
-            {"range": "Pilot!B5", "values": [[state["pilot_time_left"]]]},
+            {"range": "Cockpit!B2", "values": [[state["pilot_heading"]]]},
+            {"range": "Cockpit!B3", "values": [[state["pilot_speed"]]]},
+            {"range": "Cockpit!C2:C3", "values": [[""], [""]]},
+            {"range": "Cockpit!D2", "values": [[status]]},
+            {"range": "Cockpit!B5", "values": [[state["pilot_time_left"]]]},
         ])
         print(f"Pilot round result: {status} (score {state['pilot_score']})")
     else:
-        writes.append({"range": "Pilot!B5", "values": [[round(state["pilot_time_left"], 1)]]})
+        writes.append({"range": "Cockpit!B5", "values": [[round(state["pilot_time_left"], 1)]]})
  
     # ---- single batched write across all three worksheets ----
     retry(sh.values_batch_update, {

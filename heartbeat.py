@@ -315,10 +315,10 @@ def update_life_support(state, reboot_flag_temp, reboot_flag_stability, temp_dis
             state["temperature"] = 50.0
             temp_just_rebooted = True
             status_parts.append("temperature nominal")
-            print(">> Temp disk rebooted successfully")
+            # print(">> Temp disk rebooted successfully")
         else:
             denied_parts.append(f"temp disk: {temp_corrupted} corrupt / {temp_good} good")
-            print(">> Temp reboot denied: not ready")
+            # print(">> Temp reboot denied: not ready")
 
     if not temp_just_rebooted:
         if temp_corrupted > 0:
@@ -337,13 +337,13 @@ def update_life_support(state, reboot_flag_temp, reboot_flag_stability, temp_dis
     if stability_rebooted:
         writes.append({"range": LIFE_REBOOT_STABILITY, "values": [[False]]})
         if stability_reboot_ready:
-            state["stability"] = 50.0
+            state["stability"] = 60.0
             stability_just_rebooted = True
-            status_parts.append("stability nominal")
-            print(">> Stability disk rebooted successfully")
+            status_parts.append("stability balanced")
+            # print(">> Stability disk rebooted successfully")
         else:
             denied_parts.append(f"stability disk: {stability_corrupted} corrupt / {stability_good} good")
-            print(">> Stability reboot denied: not ready")
+            # print(">> Stability reboot denied: not ready")
 
     if not stability_just_rebooted:
         if stability_corrupted > 0:
@@ -507,10 +507,10 @@ def update_repair(state, repair_input):
         writes.extend([
             {"range": REPAIR_CODE_CELL, "values": [[new_code]]},
             {"range": REPAIR_INPUT_RANGE, "values": [[""]]},
-            {"range": REPAIR_STATUS_CELL, "values": [["CODE EXPIRED"]]},
+            {"range": REPAIR_STATUS_CELL, "values": [[""]]},
             {"range": REPAIR_TIME_CELL, "values": [[state["repair_time_left"]]]},
         ])
-        print(">> Repair code expired unmatched, rotating")
+        # print(">> Repair code expired unmatched, rotating")
     else:
         writes.append({"range": REPAIR_TIME_CELL, "values": [[round(state["repair_time_left"], 1)]]})
 
@@ -524,8 +524,8 @@ def tick(sh, state):
     inputs = read_tick_inputs(sh)
 
     writes = []
-    # writes += update_reactor(state, inputs["adjust_block"])
-    # writes += update_life_support(state, inputs["reboot_flag_temp"], inputs["reboot_flag_stability"], inputs["temp_disk"], inputs["stability_disk"])
+    writes += update_reactor(state, inputs["adjust_block"])
+    writes += update_life_support(state, inputs["reboot_flag_temp"], inputs["reboot_flag_stability"], inputs["temp_disk"], inputs["stability_disk"])
     writes += update_pilot(state, inputs["pilot_input"])
     writes += update_repair(state, inputs["repair_input"])
 

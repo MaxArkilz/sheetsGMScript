@@ -25,6 +25,10 @@ from gspread.exceptions import APIError
 SHEET_ID = "1d55txSbBoXS4qjJ28L4NK9nylOJFoWGq0AReWvOyn6c"
 TICK_SECONDS = 2                # how often the loop runs
 
+REACTOR_SHEET = "Reactor"
+LIFE_SHEET = "Life Support Computer"
+PILOT_SHEET = "Cockpit"
+
 # Reactor
 REACTOR_DELTA_RANGE = (0, 5)    # per-tick change per bar; can go up OR down,
                                  # each bar draws independently so they drift apart
@@ -33,25 +37,32 @@ NUM_BARS = 5
 REACTOR_FIRST_ROW = 3
 REACTOR_LAST_ROW = REACTOR_FIRST_ROW + NUM_BARS - 1
 
-# Life support
-# NOTE: these four are currently unused by tick() -- no code path applies a
-# steady rise, a random spike, or randomly injects corruption. Left here in
-# case that's intended future behavior; wire them into update_life_support()
-# if so.
-HEAT_BASE_RISE = 1.5
-HEAT_SPIKE_CHANCE = 0.03
-HEAT_SPIKE_AMOUNT = (15, 30)
+REACTOR_VALUES_RANGE = f"{REACTOR_SHEET}!B{REACTOR_FIRST_ROW}:B{REACTOR_LAST_ROW}"
+REACTOR_ADJUST_RANGE = f"{REACTOR_SHEET}!H5:H{4 + NUM_BARS}"
 
-CORRUPT_CHANCE = 0.02
+# Life support
+
+CORRUPT_CHANCE = 0.7
 CORRUPT_TEXT = "CORRUPTED"
+GOOD_DATA = "GOOD DATA"
 MIN_GOOD_DATA_FOR_REBOOT = 8
-TEMP_RISE_PER_CORRUPTED = 1.5
-STABILITY_LOSS_PER_CORRUPTED = 1.0
-TEMP_FALL_WHEN_CLEAN = 1.0       # passive cooldown per tick while both disks are clean
-STABILITY_GAIN_WHEN_CLEAN = 1.0  # passive stabilization per tick while both disks are clean
+TEMP_RISE_PER_CORRUPTED = 2.5
+STABILITY_LOSS_PER_CORRUPTED = 2.0
+TEMP_FALL_WHEN_CLEAN = 3.0       # passive cooldown per tick while both disks are clean
+STABILITY_GAIN_WHEN_CLEAN = 4.0  # passive stabilization per tick while both disks are clean
 MAX_TEMPERATURE = 100
 MAX_STABILITY = 100
 MIN_STABILITY = 0
+
+MAX_HISTORY = 20
+
+LIFE_TEMP_DISK_RANGE = f"{LIFE_SHEET}!H2:K30"
+LIFE_STABILITY_DISK_RANGE = f"{LIFE_SHEET}!L2:O30"
+LIFE_REBOOT_TEMP = f"{LIFE_SHEET}!F2"
+LIFE_REBOOT_STABILITY = f"{LIFE_SHEET}!G2"
+LIFE_TEMP_CELL = f"{LIFE_SHEET}!B2"
+LIFE_STABILITY_CELL = f"{LIFE_SHEET}!C2"
+LIFE_STATUS_CELL = f"{LIFE_SHEET}!B5"
 
 # Disk grids that corruption can be injected into (see LIFE_TEMP_DISK_RANGE /
 # LIFE_STABILITY_DISK_RANGE below for the matching read range).
@@ -65,36 +76,15 @@ PILOT_ROUND_SECONDS = 10        # time allowed per heading/speed target
 HEADING_TOLERANCE = 15          # degrees, wraparound-aware
 SPEED_TOLERANCE = 1
 
-MAX_HISTORY = 20
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# Canonical worksheet (tab) names. These MUST match sh.worksheet(...) calls
-# below, since every "Sheet!Range" string used in batch get/update is built
-# from them. (Previously "Life Support" vs "Life Support Computer" and
-# "Pilot" vs "Cockpit" had drifted apart, which made every batched call in
-# tick() fail with an APIError that main()'s catch-all silently swallowed.)
-REACTOR_SHEET = "Reactor"
-LIFE_SHEET = "Life Support Computer"
-PILOT_SHEET = "Cockpit"
-
-REACTOR_VALUES_RANGE = f"{REACTOR_SHEET}!B{REACTOR_FIRST_ROW}:B{REACTOR_LAST_ROW}"
-REACTOR_ADJUST_RANGE = f"{REACTOR_SHEET}!H5:H{4 + NUM_BARS}"
-
-LIFE_TEMP_DISK_RANGE = f"{LIFE_SHEET}!H2:K30"
-LIFE_STABILITY_DISK_RANGE = f"{LIFE_SHEET}!L2:O30"
-LIFE_REBOOT_RANGE = f"{LIFE_SHEET}!F2"
-LIFE_TEMP_CELL = f"{LIFE_SHEET}!B2"
-LIFE_STABILITY_CELL = f"{LIFE_SHEET}!C3"
-LIFE_STATUS_CELL = f"{LIFE_SHEET}!B5"
-
 PILOT_INPUT_RANGE = f"{PILOT_SHEET}!C2:C3"
 PILOT_HEADING_CELL = f"{PILOT_SHEET}!B2"
 PILOT_SPEED_CELL = f"{PILOT_SHEET}!B3"
 PILOT_INPUT_CLEAR_RANGE = f"{PILOT_SHEET}!C2:C3"
 PILOT_STATUS_CELL = f"{PILOT_SHEET}!D2"
 PILOT_TIME_CELL = f"{PILOT_SHEET}!B5"
+SILAS_HULL_INTEGRITY_CELL = f"{PILOT_SHEET}!E3"
 
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # ---- connection -------------------------------------------------------
 
@@ -141,7 +131,7 @@ def count_disk_data(block):
 
             if value == CORRUPT_TEXT:
                 corrupted_count += 1
-            elif value == "GOOD DATA":
+            elif value == GOOD_DATA:
                 good_data_count += 1
 
     return corrupted_count, good_data_count
@@ -197,7 +187,7 @@ def load_life_support(life_ws):
     temp_cell = retry(life_ws.acell, "B2").value
     temperature = float(temp_cell) if temp_cell not in (None, "") else 0.0
 
-    stability_cell = retry(life_ws.acell, "C3").value
+    stability_cell = retry(life_ws.acell, "C2").value
     stability = float(stability_cell) if stability_cell not in (None, "") else 100.0
 
     # Find the next empty row in the Life Support history column (D),
@@ -224,40 +214,32 @@ def load_initial_state(reactor_ws, life_ws, pilot_ws):
 # ---- tick: read ------------------------------------------------------------
 
 def read_tick_inputs(sh):
-    """Single batched read of every player-editable cell across worksheets."""
     ranges = [
         REACTOR_ADJUST_RANGE,
-        LIFE_REBOOT_RANGE,
+        LIFE_REBOOT_TEMP,
+        LIFE_REBOOT_STABILITY,
         LIFE_TEMP_DISK_RANGE,
         LIFE_STABILITY_DISK_RANGE,
         PILOT_INPUT_RANGE,
     ]
     result = retry(sh.values_batch_get, ranges)
+    value_ranges = result["valueRanges"]
 
-    inputs = {
-        "adjust_block": None,
-        "reboot_flag": None,
-        "temp_disk": [],
-        "stability_disk": [],
-        "pilot_input": None,
+    adjust_vals = value_ranges[0].get("values", [])
+    reboot_temp_vals = value_ranges[1].get("values", [])
+    reboot_stability_vals = value_ranges[2].get("values", [])
+    temp_vals = value_ranges[3].get("values", [])
+    stability_vals = value_ranges[4].get("values", [])
+    pilot_vals = value_ranges[5].get("values", [])
+
+    return {
+        "adjust_block": adjust_vals,
+        "reboot_flag_temp": reboot_temp_vals[0][0] if reboot_temp_vals and reboot_temp_vals[0] else "",
+        "reboot_flag_stability": reboot_stability_vals[0][0] if reboot_stability_vals and reboot_stability_vals[0] else "",
+        "temp_disk": temp_vals,
+        "stability_disk": stability_vals,
+        "pilot_input": pilot_vals,
     }
-
-    for vr in result["valueRanges"]:
-        rng = vr["range"]
-        vals = vr.get("values", [])
-
-        if rng.startswith(f"{REACTOR_SHEET}!"):
-            inputs["adjust_block"] = vals
-        elif rng.startswith(LIFE_REBOOT_RANGE):
-            inputs["reboot_flag"] = vals[0][0] if vals and vals[0] else ""
-        elif rng.startswith(LIFE_TEMP_DISK_RANGE):
-            inputs["temp_disk"] = vals
-        elif rng.startswith(LIFE_STABILITY_DISK_RANGE):
-            inputs["stability_disk"] = vals
-        elif rng.startswith(f"{PILOT_SHEET}!"):
-            inputs["pilot_input"] = vals
-
-    return inputs
 
 
 # ---- tick: per-system updates ------------------------------------------
@@ -295,71 +277,95 @@ def update_reactor(state, adjust_block):
     return writes
 
 
-def update_life_support(state, reboot_flag, temp_disk, stability_disk):
-    """Apply corruption damage or process a reboot attempt. Returns writes."""
+def update_life_support(state, reboot_flag_temp, reboot_flag_stability, temp_disk, stability_disk):
+    """Apply corruption damage or process a reboot attempt. Temperature and
+    stability are fully independent: each is driven only by its own disk
+    and its own reboot checkbox."""
     writes = []
 
     temp_corrupted, temp_good = count_disk_data(temp_disk)
     stability_corrupted, stability_good = count_disk_data(stability_disk)
-    total_corrupted = temp_corrupted + stability_corrupted
 
     temp_reboot_ready = temp_corrupted == 0 and temp_good >= MIN_GOOD_DATA_FOR_REBOOT
     stability_reboot_ready = stability_corrupted == 0 and stability_good >= MIN_GOOD_DATA_FOR_REBOOT
-    reboot_ready = temp_reboot_ready and stability_reboot_ready
-    rebooted = str(reboot_flag).strip().upper() == "TRUE"
 
-    if rebooted and reboot_ready:
-        state["temperature"] = 50.0
-        state["stability"] = MAX_STABILITY / 2
-        writes.extend([
-            {"range": LIFE_REBOOT_RANGE, "values": [[False]]},
-            {"range": LIFE_STATUS_CELL, "values": [["REBOOT COMPLETE — systems nominal"]]},
-        ])
-        print(">> Life Support rebooted successfully")
-    else:
-        if rebooted:
-            # Reset the checkbox when it was attempted before both disks were valid.
-            writes.extend([
-                {"range": LIFE_REBOOT_RANGE, "values": [[False]]},
-                {"range": LIFE_STATUS_CELL, "values": [[
-                    "REBOOT DENIED — clear corruption and restore 8 GOOD DATA blocks per disk"
-                ]]},
-            ])
-            print(
-                ">> Reboot denied: "
-                f"temp disk: {temp_corrupted} corrupt / {temp_good} good; "
-                f"stability disk: {stability_corrupted} corrupt / {stability_good} good"
-            )
+    temp_rebooted = str(reboot_flag_temp).strip().upper() == "TRUE"
+    stability_rebooted = str(reboot_flag_stability).strip().upper() == "TRUE"
 
-        # No corrupt data means neither system gets worse this tick.
-        if total_corrupted > 0:
+    temp_just_rebooted = False
+    stability_just_rebooted = False
+    status_parts = []
+    denied_parts = []
+
+    # --- Temperature channel (temp_disk + LIFE_REBOOT_TEMP only) ---
+    if temp_rebooted:
+        writes.append({"range": LIFE_REBOOT_TEMP, "values": [[False]]})
+        if temp_reboot_ready:
+            state["temperature"] = 50.0
+            temp_just_rebooted = True
+            status_parts.append("temperature nominal")
+            print(">> Temp disk rebooted successfully")
+        else:
+            denied_parts.append(f"temp disk: {temp_corrupted} corrupt / {temp_good} good")
+            print(">> Temp reboot denied: not ready")
+
+    if not temp_just_rebooted:
+        if temp_corrupted > 0:
             state["temperature"] = min(
                 MAX_TEMPERATURE,
-                state["temperature"] + total_corrupted * TEMP_RISE_PER_CORRUPTED,
-            )
-            state["stability"] = max(
-                MIN_STABILITY,
-                state["stability"] - total_corrupted * STABILITY_LOSS_PER_CORRUPTED,
+                state["temperature"] + temp_corrupted * TEMP_RISE_PER_CORRUPTED,
             )
         else:
-            # Both disks fully clean: systems passively recover.
+            recovery_scale = temp_good / 10
             state["temperature"] = max(
                 0.0,
-                state["temperature"] - TEMP_FALL_WHEN_CLEAN,
+                state["temperature"] - TEMP_FALL_WHEN_CLEAN * recovery_scale,
             )
+
+    # --- Stability channel (stability_disk + LIFE_REBOOT_STABILITY only) ---
+    if stability_rebooted:
+        writes.append({"range": LIFE_REBOOT_STABILITY, "values": [[False]]})
+        if stability_reboot_ready:
+            state["stability"] = 50.0
+            stability_just_rebooted = True
+            status_parts.append("stability nominal")
+            print(">> Stability disk rebooted successfully")
+        else:
+            denied_parts.append(f"stability disk: {stability_corrupted} corrupt / {stability_good} good")
+            print(">> Stability reboot denied: not ready")
+
+    if not stability_just_rebooted:
+        if stability_corrupted > 0:
+            state["stability"] = max(
+                MIN_STABILITY,
+                state["stability"] - stability_corrupted * STABILITY_LOSS_PER_CORRUPTED,
+            )
+        else:
+            recovery_scale = stability_good / 10
             state["stability"] = min(
                 MAX_STABILITY,
-                state["stability"] + STABILITY_GAIN_WHEN_CLEAN,
+                state["stability"] + STABILITY_GAIN_WHEN_CLEAN * recovery_scale,
             )
- 
-        # Corruption can spread on its own each tick, independently of the
-        # damage/recovery above. Skipped right after a successful reboot so
-        # the player gets one clean tick before the next hazard can appear.
+
+    # --- Status cell ---
+    if status_parts or denied_parts:
+        if status_parts and not denied_parts:
+            msg = "REBOOT COMPLETE — " + ", ".join(status_parts)
+        elif denied_parts and not status_parts:
+            msg = "REBOOT DENIED — clear corruption and restore 8 GOOD DATA blocks per disk"
+        else:
+            msg = "REBOOT PARTIAL — " + ", ".join(status_parts) + "; denied: " + ", ".join(denied_parts)
+        writes.append({"range": LIFE_STATUS_CELL, "values": [[msg]]})
+
+    # --- Corruption spread (independent per disk, skipped only for the
+    # disk that just successfully rebooted) ---
+    if not temp_just_rebooted:
         corrupt_write = maybe_corrupt_disk(TEMP_DISK_COLS, CORRUPT_CHANCE)
         if corrupt_write:
             writes.append(corrupt_write)
             print(">> Temp disk corruption spread")
- 
+
+    if not stability_just_rebooted:
         corrupt_write = maybe_corrupt_disk(STABILITY_DISK_COLS, CORRUPT_CHANCE)
         if corrupt_write:
             writes.append(corrupt_write)
@@ -383,7 +389,6 @@ def update_life_support(state, reboot_flag, temp_disk, stability_disk):
 
     return writes
 
-
 def update_pilot(state, pilot_input):
     """Advance the round timer and score a completed round. Returns writes."""
     writes = []
@@ -403,12 +408,12 @@ def update_pilot(state, pilot_input):
     state["pilot_time_left"] -= TICK_SECONDS
 
     if state["pilot_time_left"] <= 0:
-        hit = (
+        miss = (
             _heading_diff(player_heading, state["pilot_heading"]) <= HEADING_TOLERANCE
             and abs(player_speed - state["pilot_speed"]) <= SPEED_TOLERANCE
         )
-        status = "HIT" if hit else "MISS"
-        if hit:
+        status = "MISS" if miss else "HIT"
+        if not miss:
             state["pilot_score"] += 1
 
         state["pilot_heading"] = random.randint(0, 359)
@@ -437,9 +442,15 @@ def tick(sh, state):
     inputs = read_tick_inputs(sh)
 
     writes = []
-    writes += update_reactor(state, inputs["adjust_block"])
-    writes += update_life_support(state, inputs["reboot_flag"], inputs["temp_disk"], inputs["stability_disk"])
-    writes += update_pilot(state, inputs["pilot_input"])
+    # writes += update_reactor(state, inputs["adjust_block"])
+    writes += update_life_support(
+        state,
+        inputs["reboot_flag_temp"],
+        inputs["reboot_flag_stability"],
+        inputs["temp_disk"],
+        inputs["stability_disk"],
+    )
+    # writes += update_pilot(state, inputs["pilot_input"])
 
     retry(sh.values_batch_update, {
         "valueInputOption": "USER_ENTERED",

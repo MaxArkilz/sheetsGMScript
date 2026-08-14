@@ -15,6 +15,7 @@ SETUP (one-time):
 
 import random
 import time
+import string
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -72,7 +73,7 @@ TEMP_DISK_COLS = ["H", "I", "J", "K"]
 STABILITY_DISK_COLS = ["L", "M", "N", "O"]
 
 # Pilot
-PILOT_ROUND_SECONDS = 10        # time allowed per heading/speed target
+PILOT_ROUND_SECONDS = 8        # time allowed per heading/speed target
 HEADING_TOLERANCE = 15          # degrees, wraparound-aware
 SPEED_TOLERANCE = 1
 
@@ -83,6 +84,20 @@ PILOT_INPUT_CLEAR_RANGE = f"{PILOT_SHEET}!C2:C3"
 PILOT_STATUS_CELL = f"{PILOT_SHEET}!D2"
 PILOT_TIME_CELL = f"{PILOT_SHEET}!B5"
 SILAS_HULL_INTEGRITY_CELL = f"{PILOT_SHEET}!E3"
+
+# --- Repair (Silas) config ---
+REPAIR_CODE_LENGTH = 5
+REPAIR_INTERVAL_SECONDS = 12       # how long a code stays valid before rotating
+REPAIR_HEAL_MIN = 3
+REPAIR_HEAL_MAX = 7
+MAX_HULL_INTEGRITY = 100
+MIN_HULL_INTEGRITY = 0
+REPAIR_CODE_CHARS = string.ascii_uppercase + string.digits
+
+REPAIR_CODE_CELL = f"{PILOT_SHEET}!C9"     # displays the current code to match
+REPAIR_INPUT_RANGE = f"{PILOT_SHEET}!D9"   # player types their guess here
+REPAIR_STATUS_CELL = f"{PILOT_SHEET}!C11"  # shows "REPAIR SUCCESSFUL" or "CODE EXPIRED"
+REPAIR_TIME_CELL = f"{PILOT_SHEET}!D11"    # shows how many seconds remain before the code rotates
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -99,7 +114,6 @@ def connect():
         sh.worksheet(PILOT_SHEET),
     )
 
-
 def retry(fn, *args, retries=5, **kwargs):
     """Ensure mass editing across sheets doesn't crash loop."""
     delay = 1
@@ -113,12 +127,10 @@ def retry(fn, *args, retries=5, **kwargs):
             time.sleep(delay)
             delay *= 2
 
-
 def _heading_diff(a, b):
     """Smallest angular distance between two headings, wraparound-aware."""
     d = abs(a - b) % 360
     return min(d, 360 - d)
-
 
 def count_disk_data(block):
     """Return (corrupted_count, good_data_count) for a Sheets range."""
@@ -155,13 +167,13 @@ def ensure_pilot_sheet(pilot_ws, state):
     if existing not in (None, ""):
         state["pilot_heading"] = int(float(existing))
         state["pilot_speed"] = int(float(pilot_ws.acell("B3").value or 0))
-        state["pilot_score"] = float(pilot_ws.acell("B6").value or 0)
+        state["pilot_score"] = float(pilot_ws.acell("B6").value or 100)
         state["pilot_time_left"] = float(pilot_ws.acell("B5").value or PILOT_ROUND_SECONDS)
         return
 
     state["pilot_heading"] = random.randint(0, 359)
     state["pilot_speed"] = random.randint(1, 9)
-    state["pilot_score"] = 0
+    state["pilot_score"] = 100
     state["pilot_time_left"] = PILOT_ROUND_SECONDS
 
     retry(pilot_ws.batch_update, [
@@ -172,7 +184,6 @@ def ensure_pilot_sheet(pilot_ws, state):
         {"range": "A6:B6", "values": [["Score", state["pilot_score"]]]},
     ])
 
-
 def load_reactor_bars(reactor_ws):
     reactor_vals = retry(reactor_ws.get, f"B{REACTOR_FIRST_ROW}:B{REACTOR_LAST_ROW}")
     bars = []
@@ -181,7 +192,6 @@ def load_reactor_bars(reactor_ws):
         val = float(row[0]) if len(row) > 0 and row[0] != "" else 0
         bars.append(val)
     return bars
-
 
 def load_life_support(life_ws):
     temp_cell = retry(life_ws.acell, "B2").value
@@ -196,7 +206,6 @@ def load_life_support(life_ws):
     history_row = max(2, len(history_col) + 1)
 
     return temperature, stability, history_row
-
 
 def load_initial_state(reactor_ws, life_ws, pilot_ws):
     """One-time reads at startup: current reactor bar values, current heat,
@@ -221,6 +230,7 @@ def read_tick_inputs(sh):
         LIFE_TEMP_DISK_RANGE,
         LIFE_STABILITY_DISK_RANGE,
         PILOT_INPUT_RANGE,
+        REPAIR_INPUT_RANGE,
     ]
     result = retry(sh.values_batch_get, ranges)
     value_ranges = result["valueRanges"]
@@ -231,6 +241,7 @@ def read_tick_inputs(sh):
     temp_vals = value_ranges[3].get("values", [])
     stability_vals = value_ranges[4].get("values", [])
     pilot_vals = value_ranges[5].get("values", [])
+    repair_vals = value_ranges[6].get("values", [])
 
     return {
         "adjust_block": adjust_vals,
@@ -239,6 +250,7 @@ def read_tick_inputs(sh):
         "temp_disk": temp_vals,
         "stability_disk": stability_vals,
         "pilot_input": pilot_vals,
+        "repair_input": repair_vals,
     }
 
 
@@ -275,7 +287,6 @@ def update_reactor(state, adjust_block):
             print(f"!! Reactor bar {i + 1} hit meltdown threshold")
 
     return writes
-
 
 def update_life_support(state, reboot_flag_temp, reboot_flag_stability, temp_disk, stability_disk):
     """Apply corruption damage or process a reboot attempt. Temperature and
@@ -363,14 +374,18 @@ def update_life_support(state, reboot_flag_temp, reboot_flag_stability, temp_dis
         corrupt_write = maybe_corrupt_disk(TEMP_DISK_COLS, CORRUPT_CHANCE)
         if corrupt_write:
             writes.append(corrupt_write)
-            print(">> Temp disk corruption spread")
 
     if not stability_just_rebooted:
         corrupt_write = maybe_corrupt_disk(STABILITY_DISK_COLS, CORRUPT_CHANCE)
         if corrupt_write:
             writes.append(corrupt_write)
-            print(">> Stability disk corruption spread")
 
+    if state["temperature"] >= MAX_TEMPERATURE / 1.5:
+        print(">> Temperature approaching critical threshold! Roll CON Checks.")
+
+    if state["stability"] <= MIN_STABILITY / 1.5:
+        print(">> Stability approaching critical threshold! Roll DEX Checks.")
+    
     # Current readouts
     writes.extend([
         {"range": LIFE_TEMP_CELL, "values": [[round(state["temperature"], 1)]]},
@@ -413,8 +428,12 @@ def update_pilot(state, pilot_input):
             and abs(player_speed - state["pilot_speed"]) <= SPEED_TOLERANCE
         )
         status = "MISS" if miss else "HIT"
-        if not miss:
-            state["pilot_score"] += 1
+        if not miss and state["pilot_score"] > MIN_HULL_INTEGRITY:
+            Damage = random.randint(5, 15)
+            state["pilot_score"] -= Damage
+            print(f"Silas hit! Hull integrity -{Damage} (now {state['pilot_score']})")
+        if state["pilot_score"] < MIN_HULL_INTEGRITY:
+            print(">> Hull integrity depleted! SILAS GOING DOWN!")
 
         state["pilot_heading"] = random.randint(0, 359)
         state["pilot_speed"] = random.randint(1, 9)
@@ -426,6 +445,7 @@ def update_pilot(state, pilot_input):
             {"range": PILOT_INPUT_CLEAR_RANGE, "values": [[""], [""]]},
             {"range": PILOT_STATUS_CELL, "values": [[status]]},
             {"range": PILOT_TIME_CELL, "values": [[state["pilot_time_left"]]]},
+            {"range": SILAS_HULL_INTEGRITY_CELL, "values": [[state["pilot_score"]]]},
         ])
         print(f"Pilot round result: {status} (score {state['pilot_score']})")
     else:
@@ -433,6 +453,68 @@ def update_pilot(state, pilot_input):
 
     return writes
 
+def _generate_repair_code():
+    return "".join(random.choices(REPAIR_CODE_CHARS, k=REPAIR_CODE_LENGTH))
+
+def update_repair(state, repair_input):
+    """Advance the repair-code timer. If the player typed a matching code
+    before it rotates, grant hull healing. Returns writes."""
+    writes = []
+
+    player_guess = ""
+    if repair_input and repair_input[0]:
+        player_guess = str(repair_input[0][0]).strip().upper()
+
+    current_code = state.get("repair_code")
+    if not current_code:
+        # First tick: seed a code with no prior guess possible.
+        current_code = _generate_repair_code()
+        state["repair_code"] = current_code
+        state["repair_time_left"] = REPAIR_INTERVAL_SECONDS
+        writes.extend([
+            {"range": REPAIR_CODE_CELL, "values": [[current_code]]},
+            {"range": REPAIR_TIME_CELL, "values": [[state["repair_time_left"]]]},
+        ])
+        return writes
+
+    solved = player_guess == current_code
+
+    if solved:
+        heal = random.randint(REPAIR_HEAL_MIN, REPAIR_HEAL_MAX)
+        state["pilot_score"] = min(MAX_HULL_INTEGRITY, state["pilot_score"] + heal)
+        print(f"Repair code matched! Hull repaired +{heal} (now {state['pilot_score']})")
+
+        new_code = _generate_repair_code()
+        state["repair_code"] = new_code
+        state["repair_time_left"] = REPAIR_INTERVAL_SECONDS
+
+        writes.extend([
+            {"range": REPAIR_CODE_CELL, "values": [[new_code]]},
+            {"range": REPAIR_INPUT_RANGE, "values": [[""]]},
+            {"range": REPAIR_STATUS_CELL, "values": [["REPAIR SUCCESSFUL"]]},
+            {"range": REPAIR_TIME_CELL, "values": [[state["repair_time_left"]]]},
+            {"range": SILAS_HULL_INTEGRITY_CELL, "values": [[state["pilot_score"]]]},
+        ])
+        return writes
+
+    state["repair_time_left"] -= TICK_SECONDS
+
+    if state["repair_time_left"] <= 0:
+        new_code = _generate_repair_code()
+        state["repair_code"] = new_code
+        state["repair_time_left"] = REPAIR_INTERVAL_SECONDS
+
+        writes.extend([
+            {"range": REPAIR_CODE_CELL, "values": [[new_code]]},
+            {"range": REPAIR_INPUT_RANGE, "values": [[""]]},
+            {"range": REPAIR_STATUS_CELL, "values": [["CODE EXPIRED"]]},
+            {"range": REPAIR_TIME_CELL, "values": [[state["repair_time_left"]]]},
+        ])
+        print(">> Repair code expired unmatched, rotating")
+    else:
+        writes.append({"range": REPAIR_TIME_CELL, "values": [[round(state["repair_time_left"], 1)]]})
+
+    return writes
 
 # ---- tick: orchestration ------------------------------------------------
 
@@ -443,20 +525,14 @@ def tick(sh, state):
 
     writes = []
     # writes += update_reactor(state, inputs["adjust_block"])
-    writes += update_life_support(
-        state,
-        inputs["reboot_flag_temp"],
-        inputs["reboot_flag_stability"],
-        inputs["temp_disk"],
-        inputs["stability_disk"],
-    )
-    # writes += update_pilot(state, inputs["pilot_input"])
+    # writes += update_life_support(state, inputs["reboot_flag_temp"], inputs["reboot_flag_stability"], inputs["temp_disk"], inputs["stability_disk"])
+    writes += update_pilot(state, inputs["pilot_input"])
+    writes += update_repair(state, inputs["repair_input"])
 
     retry(sh.values_batch_update, {
         "valueInputOption": "USER_ENTERED",
         "data": writes,
     })
-
 
 def main():
     print("Heartbeat running. Ctrl+C to stop.")
@@ -469,7 +545,6 @@ def main():
             # keep the loop alive through transient API hiccups
             print("tick error:", e)
         time.sleep(TICK_SECONDS)
-
 
 if __name__ == "__main__":
     main()
